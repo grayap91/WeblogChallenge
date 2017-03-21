@@ -1,22 +1,17 @@
 package weblog;
 
-import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
-import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
-import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream;
-import org.apache.spark.HashPartitioner;
 import org.apache.spark.SparkConf;
-import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.storage.StorageLevel;
 import org.joda.time.DateTime;
 import org.joda.time.Minutes;
+import org.joda.time.Seconds;
 import scala.Tuple2;
 
 import java.io.*;
@@ -32,6 +27,8 @@ public class App
     final static int BUFFER = 2048;
 
     final static Minutes sessionWindowMinutes = Minutes.minutes(15);
+
+    final static Seconds sessionWindowSeconds = Seconds.seconds(15*60);
 
     public static void main(String[] args) throws Exception
     {
@@ -50,7 +47,7 @@ public class App
             DateTime dt = new DateTime(parts.get(0));
             logLine.setDateTime(dt);
             logLine.setUrl(parts.get(11));
-            logLine.setIpAddress(parts.get(2));
+            logLine.setIpAddress(parts.get(2).split(":")[0]);
             logLines.add(logLine);
         }
         SparkConf conf = new SparkConf();
@@ -58,47 +55,65 @@ public class App
         conf.setMaster("local[*]");
         JavaSparkContext sc = new JavaSparkContext(conf);
         JavaRDD<LogLine> logLinesRdd = sc.parallelize(logLines);
-        JavaPairRDD<String, Map<Integer, List<LogLine>>> groupedRdd = sessionize(logLinesRdd, sessionWindowMinutes);
-        groupedRdd.persist(StorageLevel.MEMORY_AND_DISK());
-        Map<String, Double> averagePerUser = computeAverageSessionLengthPerUser(groupedRdd);
-        Map<String, Minutes> maxPerUser = computeMaxSessionLengthPerUser(groupedRdd);
+
+        JavaPairRDD<String, Map<Integer, List<LogLine>>> groupedRdd = sessionize(logLinesRdd, sessionWindowSeconds);
+        groupedRdd.persist(StorageLevel.MEMORY_ONLY());
+        double averageSessionLength = computeAverageSessions(computeAverageSessionLengthPerUser(groupedRdd));
+        System.out.println("Average Session Length is "+averageSessionLength);
+        Map<String, Seconds> maxPerUser = computeMaxSessionLengthPerUser(groupedRdd);
+//        for(Map.Entry<String, Seconds> entry : maxPerUser.entrySet())
+//        {
+//            System.out.println("IP "+entry.getKey()+" MaxSession "+entry.getValue().getSeconds()+" seconds");
+//        }
         Map<String, Map<Integer, Integer>> uniqueUrls =  computeUniqueUrlPerUserPerSession(groupedRdd);
         groupedRdd.unpersist();
 
     }
 
-    private static Map<String, Double> computeAverageSessionLengthPerUser(JavaPairRDD<String, Map<Integer, List<LogLine>>> input)
+    private static JavaPairRDD<String, Tuple2<Seconds, Integer>> computeAverageSessionLengthPerUser(JavaPairRDD<String, Map<Integer, List<LogLine>>> input)
     {
-        return input.mapToPair(new PairFunction<Tuple2<String,Map<Integer,List<LogLine>>>, String, Double>() {
-            public Tuple2<String, Double> call(Tuple2<String, Map<Integer, List<LogLine>>> stringMapTuple2) throws Exception {
-                Minutes totalSessionLength = Minutes.minutes(0);
+        return input.mapToPair(new PairFunction<Tuple2<String,Map<Integer,List<LogLine>>>, String, Tuple2<Seconds, Integer>>() {
+            public Tuple2<String, Tuple2<Seconds, Integer>> call(Tuple2<String, Map<Integer, List<LogLine>>> stringMapTuple2) throws Exception {
+                Seconds totalSessionLength = Seconds.seconds(0);
                 Map<Integer, List<LogLine>> map = stringMapTuple2._2();
                 for(Map.Entry<Integer, List<LogLine>> entry : map.entrySet())
                 {
-                    Minutes sessionLength = getSessionLength(entry.getValue());
-                    totalSessionLength.plus(sessionLength);
+                    Seconds sessionLength = getSessionLength(entry.getValue());
+                    totalSessionLength = totalSessionLength.plus(sessionLength);
                 }
-                double avg = totalSessionLength.getMinutes()/map.size();
-                return Tuple2.apply(stringMapTuple2._1(), avg);
+                return new Tuple2(stringMapTuple2._1(), new Tuple2<Seconds, Integer>(totalSessionLength, map.size()));
             }
-        }).collectAsMap();
+        });
     }
 
-    private static Map<String, Minutes> computeMaxSessionLengthPerUser(JavaPairRDD<String, Map<Integer, List<LogLine>>> input)
+    private static double computeAverageSessions(JavaPairRDD<String, Tuple2<Seconds, Integer>> data)
     {
-        return input.mapToPair(new PairFunction<Tuple2<String,Map<Integer,List<LogLine>>>, String, Minutes>() {
-            public Tuple2<String, Minutes> call(Tuple2<String, Map<Integer, List<LogLine>>> stringMapTuple2) throws Exception {
-                Minutes maxSessionLength = Minutes.minutes(0);
+        Tuple2<Seconds, Integer> output = data.fold(new Tuple2<String, Tuple2<Seconds, Integer>>("",new Tuple2<Seconds, Integer>(Seconds.seconds(0), 0))
+                , new Function2<Tuple2<String, Tuple2<Seconds, Integer>>, Tuple2<String, Tuple2<Seconds, Integer>>, Tuple2<String, Tuple2<Seconds, Integer>>>() {
+            public Tuple2<String, Tuple2<Seconds, Integer>> call(Tuple2<String, Tuple2<Seconds, Integer>> stringTuple2Tuple2, Tuple2<String, Tuple2<Seconds, Integer>> stringTuple2Tuple22) throws Exception {
+                int numSessions = stringTuple2Tuple2._2()._2()+stringTuple2Tuple22._2()._2();
+                Seconds totalLength = stringTuple2Tuple2._2()._1().plus(stringTuple2Tuple22._2()._1());
+                return new Tuple2<String, Tuple2<Seconds, Integer>>("",new Tuple2<Seconds, Integer>(totalLength, numSessions));
+            }
+        })._2();
+        return (double)output._1().getSeconds()/output._2();
+    }
+
+    private static Map<String, Seconds> computeMaxSessionLengthPerUser(JavaPairRDD<String, Map<Integer, List<LogLine>>> input)
+    {
+        return input.mapToPair(new PairFunction<Tuple2<String,Map<Integer,List<LogLine>>>, String, Seconds>() {
+            public Tuple2<String, Seconds> call(Tuple2<String, Map<Integer, List<LogLine>>> stringMapTuple2) throws Exception {
+                Seconds maxSessionLength = Seconds.seconds(0);
                 Map<Integer, List<LogLine>> map = stringMapTuple2._2();
                 for(Map.Entry<Integer, List<LogLine>> entry : map.entrySet())
                 {
-                    Minutes sessionLength = getSessionLength(entry.getValue());
+                    Seconds sessionLength = getSessionLength(entry.getValue());
                     if(sessionLength.isGreaterThan(maxSessionLength))
                     {
                         maxSessionLength = sessionLength;
                     }
                 }
-                return Tuple2.apply(stringMapTuple2._1(), maxSessionLength);
+                return new Tuple2(stringMapTuple2._1(), maxSessionLength);
             }
         }).collectAsMap();
     }
@@ -107,7 +122,6 @@ public class App
     {
         return input.mapToPair(new PairFunction<Tuple2<String,Map<Integer,List<LogLine>>>, String, Map<Integer, Integer>>() {
             public Tuple2<String, Map<Integer, Integer>> call(Tuple2<String, Map<Integer, List<LogLine>>> stringMapTuple2) throws Exception {
-                Minutes maxSessionLength = Minutes.minutes(0);
                 Map<Integer, List<LogLine>> map = stringMapTuple2._2();
                 Map<Integer, Integer> out = new HashMap<Integer, Integer>();
                 for(Map.Entry<Integer, List<LogLine>> entry : map.entrySet())
@@ -116,7 +130,7 @@ public class App
                     int numUnique = getUniqueUrls(logs);
                     out.put(entry.getKey(), numUnique);
                 }
-                return Tuple2.apply(stringMapTuple2._1(), out);
+                return new Tuple2(stringMapTuple2._1(), out);
             }
         }).collectAsMap();
     }
@@ -136,13 +150,13 @@ public class App
         return count;
     }
 
-    private static Minutes getSessionLength(List<LogLine> list)
+    private static Seconds getSessionLength(List<LogLine> list)
     {
         DateTime minTime = null;
         DateTime maxTime = null;
         if(list.size()==0)
         {
-            return Minutes.minutes(0);
+            return Seconds.seconds(0);
         }
         for(LogLine logLine : list)
         {
@@ -169,27 +183,62 @@ public class App
                 }
             }
         }
-        return Minutes.minutesBetween(minTime, maxTime);
+        return Seconds.secondsBetween(minTime, maxTime);
         //which way should this go
     }
-    private static JavaPairRDD<String, Map<Integer, List<LogLine>>> sessionize(JavaRDD<LogLine> logLines, final Minutes sessionSize)
-    {
-        return logLines.sortBy(new Function<LogLine, DateTime>() {
 
-            public DateTime call(LogLine logLine) throws Exception {
-                return logLine.getDateTime();
-            }
-        }, true, 100)
+    private static Map<String, Integer> getUniqueHitsPerUser(JavaRDD<LogLine> logLines)
+    {
+        return logLines
+                .groupBy(new Function<LogLine, String>() {
+                    public String call(LogLine logLine) throws Exception {
+                        return logLine.getIpAddress();
+                    }
+                }).mapValues(new Function<Iterable<LogLine>, Integer>() {
+                    public Integer call(Iterable<LogLine> logLines) throws Exception {
+                        int count = 0;
+                        for(LogLine line : logLines)
+                        {
+                            count++;
+                        }
+                        return count;
+                    }
+                }).collectAsMap();
+    }
+    private static JavaPairRDD<String, Map<Integer, List<LogLine>>> sessionize(JavaRDD<LogLine> logLines, final Seconds sessionSize)
+    {
+        return logLines
                 .groupBy(new Function<LogLine, String>() {
                     public String call(LogLine logLine) throws Exception {
                         return logLine.getIpAddress();
                     }
                 }).mapValues(new Function<Iterable<LogLine>, Map<Integer, List<LogLine>>>() {
                      public Map<Integer, List<LogLine>> call(Iterable<LogLine> logLines) throws Exception {
+                         List<LogLine> sortedLogLines = new ArrayList<LogLine>();
+                         for(LogLine logLine : logLines)
+                         {
+                             sortedLogLines.add(logLine);
+                         }
+                         Collections.sort(sortedLogLines, new Comparator<LogLine>() {
+                             public int compare(LogLine o1, LogLine o2) {
+                                 DateTime dt1 = o1.getDateTime();
+                                 DateTime dt2 = o2.getDateTime();
+                                 if(dt1.isBefore(dt2))
+                                 {
+                                     return -1;
+                                 }
+                                 else if(dt1.isAfter(dt2))
+                                 {
+                                     return 1;
+                                 }
+                                 return 0;
+                             }
+                         });
+
                         Map<Integer, List<LogLine>> map = new HashMap<Integer, List<LogLine>>();
                         DateTime prevDateTime = null;
                         int counter = 0;
-                        for(LogLine logLine : logLines)
+                        for(LogLine logLine : sortedLogLines)
                         {
                             if(prevDateTime==null)
                             {
@@ -201,7 +250,8 @@ public class App
                             else
                             {
                                 DateTime curDateTime = logLine.getDateTime();
-                                Minutes diff = Minutes.minutesBetween(curDateTime, prevDateTime);
+                                //Minutes diff = Minutes.minutesBetween(curDateTime, prevDateTime);
+                                Seconds diff = Seconds.secondsBetween(curDateTime, prevDateTime);
                                 if(diff.isGreaterThan(sessionSize))
                                 {
                                     counter++;
